@@ -322,3 +322,17 @@ python train_models.py --model_name Enformer --modelling_strategy single_task --
 
 python train_models.py --model_name EnformerFullFrozenBase --modelling_strategy single_task_simple_regression --single_task Malinois_MPRA --use_existing_models --num_random_seeds 5 --subsample_train_set --n_train_subsample 15000
 ```
+
+---
+
+## Modifications (by ruthhannah)
+
+This repository is forked from [promoter_models](https://github.com/anikethjr/promoter_models) by Reddy et al.
+The original MTLucifer model (originally designed to predict promoter-driven 
+gene expression) was structurally modified to predict chromatin accessibility 
+instead, and applied to mouse kidney ATAC-seq data across five cell types.
+
+Please cite the original paper if using this code:
+Reddy, A.J., Herschl, M.H., Geng, X., et al. (2024). 
+Strategies for effectively modelling promoter-driven gene expression 
+using transfer learning. bioRxiv.
