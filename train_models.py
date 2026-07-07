@@ -11,21 +11,37 @@ import scipy.stats as stats
 from sklearn.metrics import r2_score, accuracy_score, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
 import seaborn as sns
-
 import torch
 
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint
+import glob
+from lightning.pytorch.tuner import Tuner
 
-from promoter_modelling.dataloaders import FluorescenceData, LL100, CCLE, Roadmap, Sharpr_MPRA, SuRE, ENCODETFChIPSeq, FluorescenceData_classification, lentiMPRA, STARRSeq, Malinois_MPRA, Malinois_MPRA_DNABERT, Malinois_MPRA_with_motifs, FluorescenceData_with_motifs, FluorescenceData_DNABERT
+from promoter_modelling.dataloaders import FluorescenceData, LL100, CCLE, Roadmap, FluorescenceData_classification, lentiMPRA, FluorescenceData_with_motifs, FluorescenceData_DNABERT
+from promoter_modelling.dataloaders.BinaryTask import BinaryTask
 from promoter_modelling import backbone_modules
 from promoter_modelling import MTL_modules
 
 np.random.seed(97)
 torch.manual_seed(97)
-torch.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision('high')
+
+# CUDA 초기화를 강제로 먼저 수행하여 MPS 충돌 회피
+if torch.cuda.is_available():
+    try:
+        # 환경 변수 재설정으로 MPS 우회
+        os.environ['CUDA_MPS_PIPE_DIRECTORY'] = ''
+        os.environ['CUDA_MPS_LOG_DIRECTORY'] = ''
+        # CUDA 디바이스 초기화
+        _ = torch.zeros(1).cuda()
+        print(f"[CUDA Init] Successfully initialized CUDA device: {torch.cuda.get_device_name(0)}")
+    except Exception as e:
+        print(f"[CUDA Init] Warning during early CUDA initialization: {e}")
+
+os.environ["WANDB_API_KEY"] = "REMOVED_API_KEY"
 
 def is_colab():
     try:
@@ -44,14 +60,11 @@ def strip_dot_slash(filepath):
 
 def get_base_directory(default_dir):
     try:
-        # Check if running in Google Colab
         if is_colab():
             print("Running in Google Colab")
             cleaned_default_dir = strip_dot_slash(default_dir)
-            # Check if Google Drive is mounted
             if is_drive_mounted():
                 print("Google Drive is mounted")
-                #base_dir = f'/content/drive/MyDrive/promoter_models/{default_dir}'
                 base_dir = os.path.join('/content/drive', 'MyDrive', 'promoter_models', cleaned_default_dir)
             else:
                 print("Google Drive is not mounted")
@@ -63,6 +76,8 @@ def get_base_directory(default_dir):
         print("Running on local machine [Name Error]")
         base_dir = default_dir
     return base_dir
+
+
 
 def train_model(args, config, finetune=False):
     # create directories
@@ -111,7 +126,7 @@ def train_model(args, config, finetune=False):
         assert len(tasks) == 1, "Motif-based models can only be trained on a single task"
         assert tasks[0] == "FluorescenceData" or tasks[0] == "FluorescenceData_DE" or ("Malinois_MPRA" in tasks[0]), "Motif-based models can only be trained on FluorescenceData, FluorescenceData_DE, or Malinois_MPRA"
 
-    # load pretrained model state dict if necessary
+    # load pretrained model state dict if necessary(Pretrained시에만 실행
     if "pretrain" in args.modelling_strategy and finetune:
         print("Loading pre-trained model state dict")
 
@@ -212,259 +227,28 @@ def train_model(args, config, finetune=False):
         else:
             name_format += "_" + args.optional_name_suffix
 
+    from promoter_modelling.dataloaders.BinaryTask import BinarySequenceDataset 
+
     # instantiate dataloaders
     dataloaders = {}
     print("Instantiating dataloaders...")
-    for task in tasks:
-        if task == "RNASeq": # special task names
-            dataloaders[task] = []
-            tasks_set = None
-            if args.modelling_strategy.startswith("pretrain"):
-                if task == "RNASeq":
-                    tasks_set = ["LL100", "CCLE", "Roadmap"]
-            elif args.modelling_strategy == "joint":
-                if task == "RNASeq":
-                    tasks_set = ["LL100", "CCLE", "Roadmap"]
-
-            for t in tasks_set:
-                if t == "LL100":
-                    dataloaders[task].append(LL100.LL100DataLoader(batch_size=batch_size, \
-                                                                    cache_dir=os.path.join(root_data_dir, "LL-100"), \
-                                                                    common_cache_dir=common_cache_dir))
-                elif t == "CCLE":
-                    dataloaders[task].append(CCLE.CCLEDataLoader(batch_size=batch_size, \
-                                                                    cache_dir=os.path.join(root_data_dir, "CCLE"), \
-                                                                    common_cache_dir=common_cache_dir))
-                elif t == "Roadmap":
-                    dataloaders[task].append(Roadmap.RoadmapDataLoader(batch_size=batch_size, \
-                                                                        cache_dir=os.path.join(root_data_dir, "Roadmap"), \
-                                                                        common_cache_dir=common_cache_dir))
-                elif t == "Sharpr_MPRA":
-                    dataloaders[task].append(Sharpr_MPRA.SharprMPRADataLoader(batch_size=batch_size, \
-                                                                                data_dir=os.path.join(root_data_dir, "Sharpr_MPRA")))
-                elif t == "lentiMPRA":
-                    dataloaders[task].append(lentiMPRA.lentiMPRADataLoader(batch_size=batch_size, \
-                                                                            cache_dir=os.path.join(root_data_dir, "lentiMPRA", \
-                                                                            common_cache_dir=common_cache_dir, 
-                                                                            shrink_test_set=args.shrink_test_set)))
-                elif t == "STARRSeq":
-                    dataloaders[task].append(STARRSeq.STARRSeqDataLoader(batch_size=batch_size, \
-                                                                            cache_dir=os.path.join(root_data_dir, "STARRSeq"), \
-                                                                            common_cache_dir=common_cache_dir))
-                elif t == "SuRE_classification":
-                    for genome_id in ["SuRE42_HG02601", "SuRE43_GM18983", "SuRE44_HG01241", "SuRE45_HG03464"]:
-                        dataloaders[task].append(SuRE.SuREDataLoader(batch_size=batch_size, \
-                                                                        genome_id=genome_id, \
-                                                                        cache_dir=os.path.join(root_data_dir, "SuRE"), \
-                                                                        common_cache_dir=common_cache_dir, \
-                                                                        datasets_save_dir=os.path.join(root_data_dir, "SuRE_data"), \
-                                                                        task="classification", \
-                                                                        shrink_test_set=args.shrink_test_set))
-                elif t == "SuRE_regression":
-                    for genome_id in ["SuRE42_HG02601", "SuRE43_GM18983", "SuRE44_HG01241", "SuRE45_HG03464"]:
-                        dataloaders[task].append(SuRE.SuREDataLoader(batch_size=batch_size, \
-                                                                        genome_id=genome_id, \
-                                                                        cache_dir=os.path.join(root_data_dir, "SuRE"), \
-                                                                        common_cache_dir=common_cache_dir, \
-                                                                        datasets_save_dir=os.path.join(root_data_dir, "SuRE_data"), \
-                                                                        task="regression", \
-                                                                        shrink_test_set=args.shrink_test_set))
-                elif t == "ENCODETFChIPSeq":
-                    dataloaders[task].append(ENCODETFChIPSeq.ENCODETFChIPSeqDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "ENCODETFChIPSeq"), \
-                                                                                        common_cache_dir=common_cache_dir, \
-                                                                                        datasets_save_dir=os.path.join(root_data_dir, "ENCODETFChIPSeq_data"), \
-                                                                                        shrink_test_set=args.shrink_test_set, \
-                                                                                        fasta_shuffle_letters_path=args.fasta_shuffle_letters_path))
-                elif t == "FluorescenceData":
-                    if args.model_name.startswith("MotifBased"):
-                        dataloaders[task].append(FluorescenceData_with_motifs.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                                     cache_dir=os.path.join(root_data_dir, "FluorescenceData_with_motifs")))
-                    elif "DNABERT" in args.model_name:
-                        dataloaders[task].append(FluorescenceData_DNABERT.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                                     cache_dir=os.path.join(root_data_dir, "FluorescenceData_DNABERT")))
-                    elif (args.modelling_strategy == "pretrain+simple_regression" and finetune) or (args.modelling_strategy == "single_task_simple_regression"):
-                        dataloaders[task].append(FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData"), \
-                                                                                        use_construct=True))
-                    else:
-                        dataloaders[task].append(FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData")))
-                elif t == "FluorescenceData_DE":
-                    if args.model_name.startswith("MotifBased"):
-                        dataloaders[task].append(FluorescenceData_with_motifs.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                                     cache_dir=os.path.join(root_data_dir, "FluorescenceData_with_motifs_DE"), \
-                                                                                                     predict_DE=True))
-                    elif "DNABERT" in args.model_name:
-                        dataloaders[task].append(FluorescenceData_DNABERT.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                                     cache_dir=os.path.join(root_data_dir, "FluorescenceData_DNABERT_DE"), \
-                                                                                                     predict_DE=True))
-                    elif (args.modelling_strategy == "pretrain+simple_regression" and finetune) or (args.modelling_strategy == "single_task_simple_regression"):
-                        dataloaders[task].append(FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData_DE"), \
-                                                                                        use_construct=True, \
-                                                                                        predict_DE=True))
-                    else:
-                        dataloaders[task].append(FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData_DE"), \
-                                                                                        predict_DE=True))
-                elif t == "FluorescenceData_classification":
-                    dataloaders[task].append(FluorescenceData_classification.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                                    cache_dir=os.path.join(root_data_dir, "FluorescenceData_classification")))
-                elif "Malinois_MPRA" in t:
-                    subsample_train_set = False
-                    n_train_subsample = None
-                    if "subsampled" in t:
-                        subsample_train_set = True
-                        n_train_subsample = int(t.split("_")[-1])
-                    if args.model_name.startswith("MotifBased"):
-                        dataloaders[task].append(Malinois_MPRA_with_motifs.MalinoisMPRADataLoader(batch_size=batch_size, \
-                                                                                            cache_dir=os.path.join(root_data_dir, "Malinois_MPRA"), \
-                                                                                            common_cache_dir=common_cache_dir, 
-                                                                                            subsample_train_set=subsample_train_set, 
-                                                                                            n_train_subsample=n_train_subsample))
-                    elif "DNABERT" in args.model_name:
-                        dataloaders[task].append(Malinois_MPRA_DNABERT.MalinoisMPRADataLoader(batch_size=batch_size, \
-                                                                                            cache_dir=os.path.join(root_data_dir, "Malinois_MPRA"), \
-                                                                                            common_cache_dir=common_cache_dir, 
-                                                                                            subsample_train_set=subsample_train_set, 
-                                                                                            n_train_subsample=n_train_subsample))
-                    else:
-                        dataloaders[task].append(Malinois_MPRA.MalinoisMPRADataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "Malinois_MPRA"), \
-                                                                                        common_cache_dir=common_cache_dir, 
-                                                                                        subsample_train_set=subsample_train_set, 
-                                                                                        n_train_subsample=n_train_subsample))
-        elif task == "LL100":
-            dataloaders[task] = LL100.LL100DataLoader(batch_size=batch_size, \
-                                                        cache_dir=os.path.join(root_data_dir, "LL-100"), \
-                                                        common_cache_dir=common_cache_dir)
-        elif task == "CCLE":
-            dataloaders[task] = CCLE.CCLEDataLoader(batch_size=batch_size, \
-                                                    cache_dir=os.path.join(root_data_dir, "CCLE"), \
-                                                    common_cache_dir=common_cache_dir)
-        elif task == "Roadmap":
-            dataloaders[task] = Roadmap.RoadmapDataLoader(batch_size=batch_size, \
-                                                            cache_dir=os.path.join(root_data_dir, "Roadmap"), \
-                                                            common_cache_dir=common_cache_dir)
-        elif task == "STARRSeq":
-            dataloaders[task] = STARRSeq.STARRSeqDataLoader(batch_size=batch_size, \
-                                                                cache_dir=os.path.join(root_data_dir, "STARRSeq"), \
-                                                                common_cache_dir=common_cache_dir)
-        elif task == "Sharpr_MPRA":
-            dataloaders[task] = Sharpr_MPRA.SharprMPRADataLoader(batch_size=batch_size, \
-                                                                    data_dir=os.path.join(root_data_dir, "Sharpr_MPRA"))
-        elif task == "lentiMPRA":
-            dataloaders[task] = lentiMPRA.lentiMPRADataLoader(batch_size=batch_size, \
-                                                                cache_dir=os.path.join(root_data_dir, "lentiMPRA"), \
-                                                                common_cache_dir=common_cache_dir, 
-                                                                shrink_test_set=args.shrink_test_set)
-        elif task == "SuRE_classification":
-            dataloaders[task] = []
-            for genome_id in ["SuRE42_HG02601", "SuRE43_GM18983", "SuRE44_HG01241", "SuRE45_HG03464"]:
-                dataloaders[task].append(SuRE.SuREDataLoader(batch_size=batch_size, \
-                                                                genome_id=genome_id, \
-                                                                cache_dir=os.path.join(root_data_dir, "SuRE"), \
-                                                                common_cache_dir=common_cache_dir, \
-                                                                datasets_save_dir=os.path.join(root_data_dir, "SuRE_data"), \
-                                                                task="classification", \
-                                                                shrink_test_set=args.shrink_test_set))
-        elif task == "SuRE_regression":
-            dataloaders[task] = []
-            for genome_id in ["SuRE42_HG02601", "SuRE43_GM18983", "SuRE44_HG01241", "SuRE45_HG03464"]:
-                dataloaders[task].append(SuRE.SuREDataLoader(batch_size=batch_size, \
-                                                                genome_id=genome_id, \
-                                                                cache_dir=os.path.join(root_data_dir, "SuRE"), \
-                                                                common_cache_dir=common_cache_dir, \
-                                                                datasets_save_dir=os.path.join(root_data_dir, "SuRE_data"), \
-                                                                task="regression", \
-                                                                shrink_test_set=args.shrink_test_set))
-        elif task == "ENCODETFChIPSeq":
-            dataloaders[task] = ENCODETFChIPSeq.ENCODETFChIPSeqDataLoader(batch_size=batch_size, \
-                                                                        cache_dir=os.path.join(root_data_dir, "ENCODETFChIPSeq"), \
-                                                                        common_cache_dir=common_cache_dir, \
-                                                                        datasets_save_dir=os.path.join(root_data_dir, "ENCODETFChIPSeq_data"), \
-                                                                        shrink_test_set=args.shrink_test_set, \
-                                                                        fasta_shuffle_letters_path=args.fasta_shuffle_letters_path)
-        elif task == "FluorescenceData":
-            if args.model_name.startswith("MotifBased"):
-                dataloaders[task] = FluorescenceData_with_motifs.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData_with_motifs"))
-            elif "DNABERT" in args.model_name:
-                dataloaders[task] = FluorescenceData_DNABERT.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData_DNABERT"))
-            elif (args.modelling_strategy == "pretrain+simple_regression" and finetune) or (args.modelling_strategy == "single_task_simple_regression"):
-                dataloaders[task] = FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                            cache_dir=os.path.join(root_data_dir, "FluorescenceData"), \
-                                                                            use_construct=True)
-            else:
-                dataloaders[task] = FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                            cache_dir=os.path.join(root_data_dir, "FluorescenceData"))
-        elif task == "FluorescenceData_DE":
-            if args.model_name.startswith("MotifBased"):
-                dataloaders[task] = FluorescenceData_with_motifs.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData_with_motifs_DE"), \
-                                                                                        predict_DE=True)
-            elif "DNABERT" in args.model_name:
-                dataloaders[task] = FluorescenceData_DNABERT.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData_DNABERT_DE"), \
-                                                                                        predict_DE=True)
-            elif (args.modelling_strategy == "pretrain+simple_regression" and finetune) or (args.modelling_strategy == "single_task_simple_regression"):
-                dataloaders[task] = FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                            cache_dir=os.path.join(root_data_dir, "FluorescenceData_DE"), \
-                                                                            use_construct=True, \
-                                                                            predict_DE=True)
-            else:
-                dataloaders[task] = FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                            cache_dir=os.path.join(root_data_dir, "FluorescenceData_DE"), \
-                                                                            predict_DE=True)
-        elif task == "FluorescenceData_classification":
-            dataloaders[task] = FluorescenceData_classification.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData_classification"))
-        elif task == "FluorescenceData_JURKAT":
-            dataloaders[task] = FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData"), \
-                                                                        return_specified_cells=[0])
-        elif task == "FluorescenceData_K562":
-            dataloaders[task] = FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData"), \
-                                                                        return_specified_cells=[1])
-        elif task == "FluorescenceData_THP1":
-            dataloaders[task] = FluorescenceData.FluorescenceDataLoader(batch_size=batch_size, \
-                                                                        cache_dir=os.path.join(root_data_dir, "FluorescenceData"), \
-                                                                        return_specified_cells=[2])
-        elif "Malinois_MPRA" in task:
-            subsample_train_set = False
-            n_train_subsample = None
-            if "subsampled" in task:
-                subsample_train_set = True
-                n_train_subsample = int(task.split("_")[-1])
-            if args.model_name.startswith("MotifBased"):
-                dataloaders[task] = Malinois_MPRA_with_motifs.MalinoisMPRADataLoader(batch_size=batch_size, \
-                                                                                    cache_dir=os.path.join(root_data_dir, "Malinois_MPRA"), \
-                                                                                    common_cache_dir=common_cache_dir, 
-                                                                                    subsample_train_set=subsample_train_set, 
-                                                                                    n_train_subsample=n_train_subsample)
-            elif "DNABERT" in args.model_name:
-                dataloaders[task] = Malinois_MPRA_DNABERT.MalinoisMPRADataLoader(batch_size=batch_size, \
-                                                                                    cache_dir=os.path.join(root_data_dir, "Malinois_MPRA"), \
-                                                                                    common_cache_dir=common_cache_dir, 
-                                                                                    subsample_train_set=subsample_train_set, 
-                                                                                    n_train_subsample=n_train_subsample)
-            else:
-                dataloaders[task] = Malinois_MPRA.MalinoisMPRADataLoader(batch_size=batch_size, \
-                                                                                cache_dir=os.path.join(root_data_dir, "Malinois_MPRA"), \
-                                                                                common_cache_dir=common_cache_dir, 
-                                                                                subsample_train_set=subsample_train_set, 
-                                                                                n_train_subsample=n_train_subsample)
     
-    all_dataloaders = []
     for task in tasks:
-        if dataloaders[task].__class__ == list:
-            all_dataloaders.extend(dataloaders[task])
+        if task == "BinaryTask":
+            dataloaders[task] = BinaryTask(
+            csv_path=args.input_csv_path,
+            batch_size=batch_size,
+            val_chr=args.val_chr,
+            test_chr=args.test_chr,
+            train_sampling_ratio=args.train_sampling_ratio
+            )
+            dataloaders[task].setup()
         else:
-            all_dataloaders.append(dataloaders[task])
-    print("Total number of dataloaders = {}".format(len(all_dataloaders)))   
+            raise ValueError(f"Unsupported task: {task}")
+
+    # flatten to list (기존 코드에서 쓰이는 형태 유지)
+    all_dataloaders = [dataloaders[task] for task in tasks]
+    print("Total number of dataloaders = {}".format(len(all_dataloaders)))  
 
     # train models
     all_seeds_r2 = {}
@@ -589,11 +373,14 @@ def train_model(args, config, finetune=False):
                     if key.startswith("model."):
                         new_state_dict[key[len("model."):]] = checkpoint["state_dict"][key]
 
-                mtlpredictor.model.load_state_dict(new_state_dict, strict=False)        
+                mtlpredictor.model.load_state_dict(new_state_dict, strict=False)
                 print("Loaded existing model")
-                
+
+                # evaluate on test set and log to wandb
+                trainer = L.Trainer(accelerator="gpu", devices=2)
+                trainer.test(mtlpredictor, mtlpredictor.get_mtldataloader().test_dataloader())
+
                 # get test set predictions
-                trainer = L.Trainer(accelerator="gpu", devices=1)
                 best_model_test_outputs = trainer.predict(mtlpredictor, mtlpredictor.get_mtldataloader().test_dataloader())
 
         else:
@@ -637,7 +424,7 @@ def train_model(args, config, finetune=False):
                             assert param.requires_grad == False
 
                 wandb_logger = WandbLogger(name=name, \
-                                        project='promoter_modelling_pytorch', log_model=False)
+                                        project=args.wandb_project_name, log_model=False)
 
                 checkpoint_filename = "best-{epoch:02d}-{" + "{}".format(metric_to_monitor) + ":.5f}"
                 checkpoint_callback = ModelCheckpoint(monitor=metric_to_monitor, \
@@ -653,12 +440,51 @@ def train_model(args, config, finetune=False):
                                     callbacks=[early_stop_callback, checkpoint_callback], \
                                     deterministic=True, \
                                     accelerator="gpu", devices=1, \
-                                    log_every_n_steps=10, default_root_dir=model_save_dir, \
+                                    log_every_n_steps=100, default_root_dir=model_save_dir, \
                                     max_epochs=max_epochs, \
                                     limit_test_batches=0, reload_dataloaders_every_n_epochs=2, enable_progress_bar = True, \
                                     gradient_clip_val=1.0, num_sanity_val_steps=32)
+                if args.find_lr:
+                    print("\n--- [학습률 찾기 시작] ---")
+                    # 1. Tuner 객체 생성
+                    tuner = Tuner(trainer)
+                    
+                    # 2. lr_find 실행
+                    lr_finder = tuner.lr_find(mtlpredictor, datamodule=mtlpredictor.get_mtldataloader())
+                    
+                    # 3. 결과 그래프 표시 및 최적 값 제안
+                    fig = lr_finder.plot(suggest=True)
+                    fig.show() # 그래프를 보여줍니다.
+                    
+                    suggested_lr = lr_finder.suggestion()
+                    print(f"--- [학습률 찾기 완료] 제안된 학습률: {suggested_lr:.8f} ---")
+                    print("이제 --find_lr 옵션을 빼고, 찾은 값을 --lr 옵션에 넣어 다시 실행하세요.")
+                    
+                    # 4. 본 학습을 시작하지 않고 함수를 종료합니다.
+                    return None, None
 
                 trainer.fit(mtlpredictor, mtlpredictor.get_mtldataloader())
+
+                # find best checkpoint
+                ckpt_dir = os.path.join(model_save_dir, name, "default", "checkpoints")
+                ckpt_files = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")))
+                if not ckpt_files:
+                    raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
+                best_ckpt = ckpt_files[-1]
+                print(f"Best checkpoint: {best_ckpt}")
+
+                # evaluate on test set and log to wandb
+                trainer.test(mtlpredictor, mtlpredictor.get_mtldataloader().test_dataloader(), ckpt_path=best_ckpt)
+
+                # 명시적으로 test 메트릭을 wandb에 기록
+                test_metrics = {k: (v.item() if hasattr(v, 'item') else v)
+                                for k, v in trainer.callback_metrics.items() if 'test' in k}
+                wandb.log(test_metrics)
+
+                # test 메트릭 출력
+                print("\n=== Test Metrics ===")
+                for k, v in test_metrics.items():
+                    print(f"{k} = {v:.4f}")
 
                 # create done file
                 done_file = os.path.join(model_save_dir, name, "default", "done.txt")
@@ -668,7 +494,7 @@ def train_model(args, config, finetune=False):
                 wandb.finish()
 
                 # get test set predictions
-                best_model_test_outputs = trainer.predict(mtlpredictor, mtlpredictor.get_mtldataloader().test_dataloader(), ckpt_path="best")
+                best_model_test_outputs = trainer.predict(mtlpredictor, mtlpredictor.get_mtldataloader().test_dataloader(), ckpt_path=best_ckpt)
 
         # get metrics
         dataloader_to_outputs = {}
@@ -869,130 +695,9 @@ def train_model(args, config, finetune=False):
         # set suptitle and save figure
         fig.suptitle("Predictions on test set using best model (number of samples = {})".format(cur_y.shape[0]))
         fig.savefig(os.path.join(summaries_save_dir, name_format + "_best_model_predictions.png"), bbox_inches="tight")
-
-        # plot replicate concordance for fluorescence data
-        if "FluorescenceData" in dataloaders:
-            fd = dataloaders["FluorescenceData"]
-
-            # first only for test set
-            fig, axs = plt.subplots(1, len(fd.output_names), figsize=(len(fd.output_names) * 6, 5))
-            for j, output in enumerate(fd.output_names):
-                first_letter_of_cell_name = output[:1]
-                replicate1 = np.log2((fd.test_set["{}{}_P4".format(first_letter_of_cell_name, 1)]) / (fd.test_set["{}{}_P7".format(first_letter_of_cell_name, 1)]))
-                replicate2 = np.log2((fd.test_set["{}{}_P4".format(first_letter_of_cell_name, 2)]) / (fd.test_set["{}{}_P7".format(first_letter_of_cell_name, 2)]))
-
-                pearsonr = stats.pearsonr(replicate1, replicate2)[0]
-                srho = stats.spearmanr(replicate1, replicate2).correlation
-
-                # plot replicate 1 vs 2
-                sns.scatterplot(x=replicate1, y=replicate2, ax=axs[j], alpha=0.5)
-
-                # draw line of best fit
-                m, b = np.polyfit(replicate1, replicate2, 1)
-                axs[j].plot(replicate1, m*replicate1 + b, color="red", label="Best fit line")
-
-                # draw line of perfect fit
-                axs[j].plot(replicate1, replicate1, color="black", label="x=y")
-
-                # set labels
-                axs[j].set_xlabel("Replicate 1")
-                axs[j].set_ylabel("Replicate 2")
-
-                # set title
-                axs[j].set_title(r"{} ($r$ = {:.4f}, $\rho$ = {:.4f})".format(output, pearsonr, srho))
-
-                # set legend
-                axs[j].legend()
-
-            # set suptitle and save figure
-            fig.suptitle("Replicate concordance for test set (number of samples = {})".format(replicate1.shape[0]))
-            fig.savefig(os.path.join(summaries_save_dir, name_format + "_replicate_concordance.png"), bbox_inches="tight")
-
-            # next for all samples
-            fig, axs = plt.subplots(1, len(fd.output_names), figsize=(len(fd.output_names) * 6, 5))
-            for j, output in enumerate(fd.output_names):
-                first_letter_of_cell_name = output[:1]
-                replicate1 = np.log2((fd.merged["{}{}_P4".format(first_letter_of_cell_name, 1)]) / (fd.merged["{}{}_P7".format(first_letter_of_cell_name, 1)]))
-                replicate2 = np.log2((fd.merged["{}{}_P4".format(first_letter_of_cell_name, 2)]) / (fd.merged["{}{}_P7".format(first_letter_of_cell_name, 2)]))
-
-                pearsonr = stats.pearsonr(replicate1, replicate2)[0]
-                srho = stats.spearmanr(replicate1, replicate2).correlation
-
-                # plot replicate 1 vs 2
-                sns.scatterplot(x=replicate1, y=replicate2, ax=axs[j], alpha=0.5)
-
-                # draw line of best fit
-                m, b = np.polyfit(replicate1, replicate2, 1)
-                axs[j].plot(replicate1, m*replicate1 + b, color="red", label="Best fit line")
-
-                # draw line of perfect fit
-                axs[j].plot(replicate1, replicate1, color="black", label="x=y")
-
-                # set labels
-                axs[j].set_xlabel("Replicate 1")
-                axs[j].set_ylabel("Replicate 2")
-
-                # set title
-                axs[j].set_title(r"{} ($r$ = {:.4f}, $\rho$ = {:.4f})".format(output, pearsonr, srho))
-
-                # set legend
-                axs[j].legend()
-
-            # set suptitle and save figure
-            fig.suptitle("Replicate concordance across all {} samples".format(replicate1.shape[0]))
-            fig.savefig(os.path.join(summaries_save_dir, name_format + "_replicate_concordance_all_samples.png"), bbox_inches="tight")
-
-    
-    print()
-    if len(all_seeds_r2) > 0:
-        print("FINAL RESULTS ON FLUORESCENCE DATA")
-        summary = vars(args)
-        for output in all_seeds_r2:
-            r2 = np.average(all_seeds_r2[output])
-            pearsonr = np.average(all_seeds_pearsonr[output])
-            srho = np.average(all_seeds_srho[output])
-
-            highly_expressed_promoters_r2 = np.average(all_seeds_highly_expressed_promoters_r2[output])
-            highly_expressed_promoters_pearsonr = np.average(all_seeds_highly_expressed_promoters_pearsonr[output])
-            highly_expressed_promoters_srho = np.average(all_seeds_highly_expressed_promoters_srho[output])
-
-            lowly_expressed_promoters_r2 = np.average(all_seeds_lowly_expressed_promoters_r2[output])
-            lowly_expressed_promoters_pearsonr = np.average(all_seeds_lowly_expressed_promoters_pearsonr[output])
-            lowly_expressed_promoters_srho = np.average(all_seeds_lowly_expressed_promoters_srho[output])
-
-            extreme_expression_promoters_r2 = np.average(all_seeds_extreme_expression_promoters_r2[output])
-            extreme_expression_promoters_pearsonr = np.average(all_seeds_extreme_expression_promoters_pearsonr[output])
-            extreme_expression_promoters_srho = np.average(all_seeds_extreme_expression_promoters_srho[output])
-            
-            print("{} avg R2 = {} ≈ {}".format(output, r2, np.around(r2, 4)))
-            print("{} avg PearsonR = {} ≈ {}".format(output, pearsonr, np.around(pearsonr, 4)))
-            print("{} avg Spearman rho = {} ≈ {}".format(output, srho, np.around(srho, 4)))
-            print()
-
-            print("{} avg R2 (highly expressed promoters) = {} ≈ {}".format(output, highly_expressed_promoters_r2, np.around(highly_expressed_promoters_r2, 4)))
-            print("{} avg PearsonR (highly expressed promoters) = {} ≈ {}".format(output, highly_expressed_promoters_pearsonr, np.around(highly_expressed_promoters_pearsonr, 4)))
-            print("{} avg Spearman rho (highly expressed promoters) = {} ≈ {}".format(output, highly_expressed_promoters_srho, np.around(highly_expressed_promoters_srho, 4)))
-            print()
-
-            print("{} avg R2 (lowly expressed promoters) = {} ≈ {}".format(output, lowly_expressed_promoters_r2, np.around(lowly_expressed_promoters_r2, 4)))
-            print("{} avg PearsonR (lowly expressed promoters) = {} ≈ {}".format(output, lowly_expressed_promoters_pearsonr, np.around(lowly_expressed_promoters_pearsonr, 4)))
-            print("{} avg Spearman rho (lowly expressed promoters) = {} ≈ {}".format(output, lowly_expressed_promoters_srho, np.around(lowly_expressed_promoters_srho, 4)))
-            print()
-
-            print("{} avg R2 (extreme expression promoters) = {} ≈ {}".format(output, extreme_expression_promoters_r2, np.around(extreme_expression_promoters_r2, 4)))
-            print("{} avg PearsonR (extreme expression promoters) = {} ≈ {}".format(output, extreme_expression_promoters_pearsonr, np.around(extreme_expression_promoters_pearsonr, 4)))
-            print("{} avg Spearman rho (extreme expression promoters) = {} ≈ {}".format(output, extreme_expression_promoters_srho, np.around(extreme_expression_promoters_srho, 4)))
-            print()
-
-            summary[output + "_avg_R2"] = r2
-            summary[output + "_avg_PearsonR"] = pearsonr
-            summary[output + "_avg_SpearmanR"] = srho
         
-        # save summary
-        with open(os.path.join(summaries_save_dir, name_format + ".json"), "w") as f:
-            json.dump(summary, f, indent=4)
+    return all_seeds_y, all_seeds_pred
 
-    print("Done!")
 
 args = argparse.ArgumentParser()
 args.add_argument("--config_path", type=str, default="./config.json", help="Path to config file")
@@ -1026,7 +731,7 @@ args.add_argument("--num_random_seeds", type=int, default=1, help="Number of ran
 args.add_argument("--use_existing_models", action="store_true", help="Use existing models if available")
 
 args.add_argument("--wandb_project_name", type=str, default="promoter_modelling", help="Wandb project name")
-args.add_argument("--metric_to_monitor", type=str, default="val_Fluorescence_mean_SpearmanR", help="Name of metric to monitor for early stopping")
+args.add_argument("--metric_to_monitor", type=str, default="val_BinaryTask_avg_epoch_loss", help="Name of metric to monitor for early stopping")
 args.add_argument("--metric_direction_which_is_optimal", type=str, default="max", help="Should metric be maximised (specify 'max') or minimised (specify 'min')?")
 args.add_argument("--pretrain_metric_to_monitor", type=str, default="overall_val_loss", help="Name of pretrain metric to monitor for early stopping")
 args.add_argument("--pretrain_metric_direction_which_is_optimal", type=str, default="min", help="Should pretrain metric be maximised (specify 'max') or minimised (specify 'min')?")
@@ -1037,6 +742,14 @@ args.add_argument("--optional_name_suffix", type=str, default=None, help="Option
 
 args.add_argument("--fasta_shuffle_letters_path", type=str, default="fasta_shuffle_letters", help="Full path to the fasta_shuffle_letters executable")
 
+args.add_argument("--val_chr", type=str, default="chr5", help="검증(Validation)에 사용할 Chromosome")
+args.add_argument("--test_chr", type=str, default="chr7", help="테스트(Test)에 사용할 Chromosome")
+args.add_argument("--train_sampling_ratio", type=float, default=1.0, help="학습 데이터 샘플링 비율 (예: 0.5는 50%)")
+args.add_argument("--find_lr", action="store_true", help="학습을 시작하지 않고, 최적의 학습률을 찾습니다.")
+args.add_argument("--strategy", type=str, default=None, 
+                  help="PyTorch Lightning distributed training strategy (e.g., 'ddp', 'fsdp').")
+
+args.add_argument("--input_csv_path", type=str, default=None, help="Path to the custom input CSV file for binary classification task")
 args = args.parse_args()
 
 assert os.path.exists(args.config_path), "Config file does not exist"
@@ -1076,14 +789,63 @@ os.environ["WANDB_DIR"] = wandb_logs_save_dir
 os.environ["WANDB_CACHE_DIR"] = wandb_cache_dir
 
 # use GPU if available
-device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[DEBUG] CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
+print(f"[DEBUG] SLURM_JOB_GPUS: {os.environ.get('SLURM_JOB_GPUS', 'NOT SET')}")
+print(f"[DEBUG] PyTorch version: {torch.__version__}")
+print(f"[DEBUG] PyTorch built with CUDA: {torch.version.cuda}")
+try:
+    cuda_available = torch.cuda.is_available()
+    print(f"[DEBUG] torch.cuda.is_available(): {cuda_available}")
+    if cuda_available:
+        print(f"[DEBUG] torch.cuda.device_count(): {torch.cuda.device_count()}")
+    else:
+        # CUDA가 사용 불가능한 이유를 더 자세히 확인
+        try:
+            torch.cuda.device_count()
+        except Exception as e2:
+            print(f"[DEBUG] torch.cuda.device_count() error: {e2}")
+except Exception as e:
+    print(f"[DEBUG] Error checking CUDA: {e}")
+    cuda_available = False
+
+device = "cuda" if cuda_available else "cpu"
 print("Using {} device".format(device))
 
 # train models
 if "pretrain" in args.modelling_strategy:
     train_model(args, config, finetune=False)
-    train_model(args, config, finetune=True)
+    y, pred = train_model(args, config, finetune=True)
 else:
-    train_model(args, config, finetune=False)
+    y, pred = train_model(args, config, finetune=False)
+
+# Save training summary
+from datetime import datetime
+import torch
+
+save_dir = os.path.join(config["root_dir"], "summaries")
+os.makedirs(save_dir, exist_ok=True)
+
+# 자동으로 best ckpt 찾기 (마지막 저장 기준)
+ckpt_dir = os.path.join(config["root_dir"], "saved_models", f"individual_training_on_{args.single_task}", "default", "checkpoints")
+ckpts = sorted([f for f in os.listdir(ckpt_dir) if f.endswith(".ckpt")])
+if ckpts:
+    best_ckpt = os.path.join(ckpt_dir, ckpts[-1])  # 가장 최근 파일
+    ckpt_data = torch.load(best_ckpt, map_location="cpu")
+    epoch = ckpt_data.get("epoch", "N/A")
+    step = ckpt_data.get("global_step", "N/A")
+    val_loss = None
+    for part in best_ckpt.split("-"):
+        if part.startswith("val_"):
+            val_loss = part.split("=")[-1].replace(".ckpt", "")
+
+    with open(os.path.join(save_dir, "metrics_summary.txt"), "w") as f:
+        f.write(f"Best Epoch: {epoch}\n")
+        f.write(f"Global Step: {step}\n")
+        f.write(f"Validation Loss: {val_loss if val_loss else 'N/A'}\n")
+
+torch.save(y, "y.pt")
+torch.save(pred, "pred.pt")
+print("Saved y.pt and pred.pt!")
+
 
 print("ALL DONE!")

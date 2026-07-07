@@ -10,6 +10,7 @@ from sklearn.model_selection import GridSearchCV, PredefinedSplit
 from tqdm import tqdm
 
 from joblib import dump, load
+from torchmetrics.classification import BinaryAUROC
 
 import torch
 import torch.nn as nn
@@ -91,7 +92,7 @@ class MTLPredictor(L.LightningModule):
                  all_dataloader_modules, \
                  batch_size, \
                  max_epochs=None, \
-                 n_cpus=0, \
+                 n_cpus=5, \
                  lr=1e-5, \
                  weight_decay=1e-4, \
                  with_motifs=False, \
@@ -201,6 +202,12 @@ class MTLPredictor(L.LightningModule):
             self.lr = lr
             self.weight_decay = weight_decay
             self.max_epochs = max_epochs
+            self.val_auroc = BinaryAUROC()
+            self._val_pos = 0
+            self._val_total = 0
+            self.test_auroc = BinaryAUROC()
+            self._test_pos = 0
+            self._test_total = 0
 
     def fit_simple_regression(self, unified_cache_dir, cache_dir, device, batch_size, use_existing_models):
         print("Fitting simple regression models")
@@ -394,11 +401,11 @@ class MTLPredictor(L.LightningModule):
                 else:
                     loss += coeff * l_funcs[i](y_hat[i], y) + torch.log(std)
             
-            self.log("{}_train_loss".format(self.all_dataloaders[i].name), loss.cpu().detach().float(), on_step=True, on_epoch=True, logger=True)
+            self.log("{}_train_loss".format(self.all_dataloaders[i].name), loss.cpu().detach().float(), on_step=False, on_epoch=True, logger=True)
 
             total_loss += loss
-        
-        self.log("train_loss", total_loss.cpu().detach().float(), on_step=True, on_epoch=True, logger=True)
+
+        self.log("train_loss", total_loss.cpu().detach().float(), on_step=False, on_epoch=True, logger=True)
 
         return total_loss
     
@@ -501,7 +508,11 @@ class MTLPredictor(L.LightningModule):
         self.all_dataloaders[dataloader_idx].update_metrics(pred.cpu().detach().float(), y.cpu().detach().float(), loss.cpu().detach().float(), "val")
 
         self.log("{}_val_loss".format(self.all_dataloaders[dataloader_idx].name), loss.cpu().detach().float())
-    
+        prob = torch.sigmoid(pred)
+        self.val_auroc.update(prob, y.int())
+        self._val_pos += int(y.sum().detach().item())
+        self._val_total += int(y.numel())
+        
     def on_validation_epoch_end(self):
         overall_loss = 0
         for i, dl in enumerate(self.all_dataloaders):
@@ -511,9 +522,20 @@ class MTLPredictor(L.LightningModule):
 
         self.log("overall_val_loss", overall_loss)
 
+        if 0 < self._val_pos < self._val_total:
+            val_auc = self.val_auroc.compute()
+            self.log(
+                "val_BinaryTask_auroc", val_auc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        else:
+            self.log("val_BinaryTask_auroc", float("nan"),on_step=False, on_epoch=True,prog_bar=True, sync_dist=True)
+
+        self.val_auroc.reset()
+        self._val_pos = 0
+        self._val_total = 0
+        
         gc.collect()
         torch.cuda.empty_cache()
-    
+        
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         if self.with_motifs:
             if self.all_dataloader_modules[dataloader_idx].with_mask:
@@ -613,15 +635,30 @@ class MTLPredictor(L.LightningModule):
         self.all_dataloaders[dataloader_idx].update_metrics(pred.cpu().detach().float(), y.cpu().detach().float(), loss.cpu().detach().float(), "test")
 
         self.log("{}_test_loss".format(self.all_dataloaders[dataloader_idx].name), loss.cpu().detach().float())
+        prob = torch.sigmoid(pred)
+        self.test_auroc.update(prob, y.int())
+        self._test_pos += int(y.sum().detach().item())
+        self._test_total += int(y.numel())
         
-    def test_epoch_end(self, test_step_outputs):        
+    def on_test_epoch_end(self):
         overall_loss = 0
         for i, dl in enumerate(self.all_dataloaders):
             dl_metrics = dl.compute_metrics("test")
-            self.log_dict(dl_metrics, on_step=False, on_epoch=True, logger=True) 
+            self.log_dict(dl_metrics, on_step=False, on_epoch=True, logger=True)
             overall_loss += dl_metrics["test_{}_avg_epoch_loss".format(dl.name)]
 
-        self.log("overall_test_loss", overall_loss)
+        self.log("overall_test_loss", overall_loss, logger=True)
+
+        if 0 < self._test_pos < self._test_total:
+            test_auc = self.test_auroc.compute()
+            self.log(
+                "test_BinaryTask_auroc", test_auc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, logger=True)
+        else:
+            self.log("test_BinaryTask_auroc", float("nan"), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, logger=True)
+
+        self.test_auroc.reset()
+        self._test_pos = 0
+        self._test_total = 0
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -725,6 +762,20 @@ class MTLPredictor(L.LightningModule):
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
             return [optimizer], [scheduler]
 
-        print("Using AdamW lr = {} weight_decay = {}".format(self.lr, self.weight_decay))
-        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr, weight_decay=self.weight_decay)
-        return optimizer
+        else:
+            # --- OneCycleLR 스케줄러를 사용하는 동적 학습률 ---
+             div_factor = 25
+             print("Using AdamW + OneCycleLR  max_lr = {}  div_factor = {}".format(self.lr, div_factor))
+             optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()),lr=self.lr / div_factor,weight_decay=self.weight_decay)
+             scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                 optimizer,
+                 max_lr=self.lr,
+                 steps_per_epoch=len(self.all_dataloaders[-1].train_dataloader()),
+                 epochs=self.max_epochs,
+                 pct_start=0.30)
+             return [optimizer], [dict(scheduler=scheduler, interval='step')]
+
+            # --- 정된 학습률(lr)을 사용 ---
+            #print(f"Using AdamW with a fixed learning rate: {self.lr}")
+            #optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr, weight_decay=self.weight_decay)
+            #return optimizer

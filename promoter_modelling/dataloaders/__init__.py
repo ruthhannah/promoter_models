@@ -1,0 +1,2 @@
+from promoter_modelling.dataloaders.BinaryTask import BinaryTask
+from promoter_modelling.dataloaders.RegressionTask import RegressionTask

@@ -76,6 +76,10 @@ def get_all_backbone_names():
 class CNNBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding="same", dilation=1, bias=True, gn_num_groups=None, gn_group_size=16):
         super().__init__()
+        # Calculate padding manually if stride != 1 (since padding='same' is not supported for strided convolutions)
+        if stride != 1:
+            if padding == "same":
+                padding = (kernel_size - 1) // 2
         self.cnn = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, \
                              stride=stride, padding=padding, dilation=dilation, bias=bias)
         if gn_num_groups is None:
@@ -207,10 +211,11 @@ class MTLucifer(nn.Module):
         self.mlp_dim = nucleotide_embed_dims * mlp_dim_ratio
         
         self.promoter_cnn = nn.Sequential(
-                                            CNNBlock(in_channels = 4, out_channels = 256, kernel_size = 5, stride = 1, bias=True),
-                                            CNNBlock(in_channels = 256, out_channels = 512, kernel_size = 5, stride = 1, bias=True),
-                                            CNNBlock(in_channels = 512, out_channels = nucleotide_embed_dims, kernel_size = 5, stride = 1, bias=True)
-                                         )
+    CNNBlock(in_channels=4, out_channels=256, kernel_size=5, stride=1, bias=True),
+    CNNBlock(in_channels=256, out_channels=512, kernel_size=5, stride=1, bias=True),
+    CNNBlock(in_channels=512, out_channels=nucleotide_embed_dims, kernel_size=5, stride=1, bias=True),
+    nn.MaxPool1d(kernel_size=2, stride=2)
+)
         self.promoter_transformer = nn.Sequential(
                                             TransformerBlock(d_model=nucleotide_embed_dims, nhead=self.nheads, mlp_dim=self.mlp_dim),
                                             TransformerBlock(d_model=nucleotide_embed_dims, nhead=self.nheads, mlp_dim=self.mlp_dim),
