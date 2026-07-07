@@ -1,12 +1,9 @@
 import numpy as np
 import pandas as pd
 import os
-import pdb
 import argparse
 import wandb
-import h5py
 import json
-from tqdm import tqdm
 import scipy.stats as stats
 from sklearn.metrics import r2_score, accuracy_score, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
@@ -788,23 +785,9 @@ os.environ["WANDB_DIR"] = wandb_logs_save_dir
 os.environ["WANDB_CACHE_DIR"] = wandb_cache_dir
 
 # use GPU if available
-print(f"[DEBUG] CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
-print(f"[DEBUG] SLURM_JOB_GPUS: {os.environ.get('SLURM_JOB_GPUS', 'NOT SET')}")
-print(f"[DEBUG] PyTorch version: {torch.__version__}")
-print(f"[DEBUG] PyTorch built with CUDA: {torch.version.cuda}")
 try:
     cuda_available = torch.cuda.is_available()
-    print(f"[DEBUG] torch.cuda.is_available(): {cuda_available}")
-    if cuda_available:
-        print(f"[DEBUG] torch.cuda.device_count(): {torch.cuda.device_count()}")
-    else:
-        # CUDA가 사용 불가능한 이유를 더 자세히 확인
-        try:
-            torch.cuda.device_count()
-        except Exception as e2:
-            print(f"[DEBUG] torch.cuda.device_count() error: {e2}")
-except Exception as e:
-    print(f"[DEBUG] Error checking CUDA: {e}")
+except Exception:
     cuda_available = False
 
 device = "cuda" if cuda_available else "cpu"
@@ -818,7 +801,6 @@ else:
     y, pred = train_model(args, config, finetune=False)
 
 # Save training summary
-from datetime import datetime
 import torch
 
 save_dir = os.path.join(config["root_dir"], "summaries")
