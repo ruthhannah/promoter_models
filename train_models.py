@@ -17,7 +17,6 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 import glob
 from lightning.pytorch.tuner import Tuner
 
-from promoter_modelling.dataloaders import FluorescenceData, LL100, CCLE, Roadmap, FluorescenceData_classification, lentiMPRA, FluorescenceData_with_motifs, FluorescenceData_DNABERT
 from promoter_modelling.dataloaders.BinaryTask import BinaryTask
 from promoter_modelling import backbone_modules
 from promoter_modelling import MTL_modules
