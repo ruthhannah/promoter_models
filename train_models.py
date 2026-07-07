@@ -41,7 +41,6 @@ if torch.cuda.is_available():
     except Exception as e:
         print(f"[CUDA Init] Warning during early CUDA initialization: {e}")
 
-os.environ["WANDB_API_KEY"] = "REMOVED_API_KEY"
 
 def is_colab():
     try:
